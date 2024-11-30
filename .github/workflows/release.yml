@@ -1,5 +1,11 @@
 name: Release
 
+# Add these permissions at the top level of the workflow
+permissions:
+  contents: write
+  discussions: write # If you want release notes to be posted to discussions
+  pull-requests: write # If you want release notes to reference PRs
+
 on:
   push:
     tags:
@@ -64,15 +70,16 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
           
       - name: Build
+        shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == *"-linux-musl" ]]; then
+          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == *"-linux-musl" ]]; then
             rustup target add ${{ matrix.target }}
           fi
           cargo build --release --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           # Force static linking for Linux builds
-          RUSTFLAGS: '-C target-feature=+crt-static'
+          RUSTFLAGS: ${{ contains(matrix.target, 'linux-musl') && '-C target-feature=+crt-static' || '' }}
 
       - name: Prepare binary
         shell: bash
@@ -89,24 +96,31 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}.*
+          if-no-files-found: error
 
   create-release:
     needs: build-and-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List files
+        run: ls -R artifacts/
+        shell: bash
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            **/daily-term-shortcut-*-amd64.zip
-            **/daily-term-shortcut-*-amd64.tar.gz
-            **/daily-term-shortcut-*-arm64.zip
-            **/daily-term-shortcut-*-arm64.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
