@@ -22,7 +22,7 @@ Download the pre-built binary for your system from the [releases page](https://g
 
 - Linux (x86_64, ARM64) - Static binaries, no dependencies required
 - Windows (x86_64, ARM64)
-- macOS (Intel, Apple Silicon)
+- macOS (Intel, Apple Silicon) - Signed and notarized for enhanced security
 
 ### Building from source
 
