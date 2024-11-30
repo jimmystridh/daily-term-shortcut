@@ -1,5 +1,7 @@
 # Daily Term Shortcut
 
+[![Release](https://github.com/jimmystridh/daily-term-shortcut/actions/workflows/release.yml/badge.svg)](https://github.com/jimmystridh/daily-term-shortcut/actions/workflows/release.yml)
+
 A simple, elegant TUI application that helps you learn keyboard shortcuts by showing you a new one each day. Built with Rust using the `ratatui` framework.
 
 ![screenshot](screenshot.png)
@@ -13,6 +15,16 @@ A simple, elegant TUI application that helps you learn keyboard shortcuts by sho
 - 🔄 Cycles through shortcuts based on day of year
 
 ## Installation
+
+### Pre-built binaries
+
+Download the pre-built binary for your system from the [releases page](https://github.com/jimmystridh/daily-term-shortcut/releases). Available for:
+
+- Linux (x86_64, ARM64) - Static binaries, no dependencies required
+- Windows (x86_64, ARM64)
+- macOS (Intel, Apple Silicon)
+
+### Building from source
 
 1. Ensure you have Rust installed on your system. If not, install it from [rustup.rs](https://rustup.rs/).
 
