@@ -2,7 +2,7 @@
 
 A simple, elegant TUI application that helps you learn keyboard shortcuts by showing you a new one each day. Built with Rust using the `ratatui` framework.
 
-[screenshot](screenshot.png)
+![screenshot](screenshot.png)
 
 ## Features
 
