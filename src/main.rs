@@ -1,4 +1,3 @@
-use chrono::Datelike;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -12,16 +11,20 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     error::Error,
+    fs,
     io,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, Hash)]
 struct Shortcut {
     key: String,
     description: String,
@@ -33,10 +36,45 @@ struct ShortcutData {
     shortcuts: Vec<Shortcut>,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct Config {
+    /// Number of new shortcuts to show per session (1, 2, 3, etc.)
+    shortcuts_per_session: usize,
+    /// Categories to include (empty = all categories)
+    enabled_categories: Vec<String>,
+    /// Show session shortcuts panel
+    show_session_shortcuts: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            shortcuts_per_session: 1,
+            enabled_categories: Vec::new(), // Empty means all
+            show_session_shortcuts: true,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+struct AppState {
+    /// Shortcuts that have been shown (key + description for uniqueness)
+    shown_shortcuts: HashSet<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            shown_shortcuts: HashSet::new(),
+        }
+    }
+}
+
 enum AppMode {
     Normal,
     Search,
     Help,
+    Settings,
 }
 
 struct App {
@@ -47,26 +85,59 @@ struct App {
     categories: Vec<String>,
     mode: AppMode,
     search_input: Input,
-    show_daily: bool,
-    daily_shortcut: Shortcut,
+    show_session_shortcuts: bool,
+    session_shortcuts: Vec<Shortcut>,
+    config: Config,
+    state: AppState,
+    config_path: PathBuf,
+    state_path: PathBuf,
 }
 
 impl App {
-    fn new(shortcuts: Vec<Shortcut>) -> App {
-        let daily_shortcut = get_todays_shortcut(&shortcuts).clone();
+    fn new(
+        shortcuts: Vec<Shortcut>,
+        config: Config,
+        state: AppState,
+        config_path: PathBuf,
+        state_path: PathBuf,
+    ) -> App {
         let categories = get_categories(&shortcuts);
-        let filtered_shortcuts = shortcuts.clone();
+
+        // Filter shortcuts by enabled categories if specified
+        let available_shortcuts: Vec<Shortcut> = if config.enabled_categories.is_empty() {
+            shortcuts.clone()
+        } else {
+            shortcuts
+                .iter()
+                .filter(|s| config.enabled_categories.contains(&s.category))
+                .cloned()
+                .collect()
+        };
+
+        // Select session shortcuts (new ones not yet shown)
+        let session_shortcuts = select_session_shortcuts(
+            &available_shortcuts,
+            &state,
+            config.shortcuts_per_session,
+        );
+
+        let filtered_shortcuts = available_shortcuts.clone();
+        let show_session_shortcuts = config.show_session_shortcuts;
 
         App {
-            shortcuts,
+            shortcuts: available_shortcuts,
             filtered_shortcuts,
             selected: 0,
             category_filter: None,
             categories,
             mode: AppMode::Normal,
             search_input: Input::default(),
-            show_daily: true,
-            daily_shortcut,
+            show_session_shortcuts,
+            session_shortcuts,
+            config,
+            state,
+            config_path,
+            state_path,
         }
     }
 
@@ -165,13 +236,60 @@ impl App {
             self.selected = 0;
         }
     }
+
+    fn mark_session_shortcuts_shown(&mut self) -> io::Result<()> {
+        for shortcut in &self.session_shortcuts {
+            let key = format!("{}:{}", shortcut.key, shortcut.description);
+            self.state.shown_shortcuts.insert(key);
+        }
+        save_state(&self.state_path, &self.state)?;
+        Ok(())
+    }
+
+    fn reset_progress(&mut self) -> io::Result<()> {
+        self.state.shown_shortcuts.clear();
+        save_state(&self.state_path, &self.state)?;
+
+        // Regenerate session shortcuts
+        self.session_shortcuts = select_session_shortcuts(
+            &self.shortcuts,
+            &self.state,
+            self.config.shortcuts_per_session,
+        );
+        Ok(())
+    }
 }
 
-fn get_todays_shortcut(shortcuts: &[Shortcut]) -> &Shortcut {
-    let today = chrono::Local::now();
-    let day_of_year = today.ordinal0() as usize;
-    let index = day_of_year % shortcuts.len();
-    &shortcuts[index]
+fn select_session_shortcuts(
+    shortcuts: &[Shortcut],
+    state: &AppState,
+    count: usize,
+) -> Vec<Shortcut> {
+    let mut rng = rand::thread_rng();
+
+    // Find shortcuts that haven't been shown yet
+    let unshown: Vec<Shortcut> = shortcuts
+        .iter()
+        .filter(|s| {
+            let key = format!("{}:{}", s.key, s.description);
+            !state.shown_shortcuts.contains(&key)
+        })
+        .cloned()
+        .collect();
+
+    // If we've shown all shortcuts, start over with all of them
+    let pool = if unshown.is_empty() {
+        shortcuts.to_vec()
+    } else {
+        unshown
+    };
+
+    // Randomly select the requested number
+    let mut selected = pool.clone();
+    selected.shuffle(&mut rng);
+    selected.truncate(count);
+
+    selected
 }
 
 fn get_categories(shortcuts: &[Shortcut]) -> Vec<String> {
@@ -183,6 +301,55 @@ fn get_categories(shortcuts: &[Shortcut]) -> Vec<String> {
         .collect();
     categories.sort();
     categories
+}
+
+fn get_config_dir() -> io::Result<PathBuf> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not find config directory"))?
+        .join("keyboard-shortcuts-master");
+
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir)?;
+    }
+
+    Ok(config_dir)
+}
+
+fn load_config(path: &PathBuf) -> io::Result<Config> {
+    if path.exists() {
+        let content = fs::read_to_string(path)?;
+        toml::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    } else {
+        let config = Config::default();
+        save_config(path, &config)?;
+        Ok(config)
+    }
+}
+
+fn save_config(path: &PathBuf, config: &Config) -> io::Result<()> {
+    let content = toml::to_string_pretty(config)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn load_state(path: &PathBuf) -> io::Result<AppState> {
+    if path.exists() {
+        let content = fs::read_to_string(path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    } else {
+        let state = AppState::default();
+        save_state(path, &state)?;
+        Ok(state)
+    }
+}
+
+fn save_state(path: &PathBuf, state: &AppState) -> io::Result<()> {
+    let content = serde_json::to_string_pretty(state)?;
+    fs::write(path, content)?;
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -486,6 +653,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let shortcut_data: ShortcutData = serde_json::from_str(shortcuts_json)?;
 
+    // Load configuration and state
+    let config_dir = get_config_dir()?;
+    let config_path = config_dir.join("config.toml");
+    let state_path = config_dir.join("state.json");
+
+    let config = load_config(&config_path)?;
+    let state = load_state(&state_path)?;
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -494,7 +669,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let app = App::new(shortcut_data.shortcuts);
+    let app = App::new(shortcut_data.shortcuts, config, state, config_path, state_path);
     let res = run_app(&mut terminal, app);
 
     // Restore terminal
@@ -546,14 +721,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             app.mode = AppMode::Normal;
                         }
                     }
+                    AppMode::Settings => {
+                        if key.code == KeyCode::Char('s') || key.code == KeyCode::Esc {
+                            app.mode = AppMode::Normal;
+                        } else if key.code == KeyCode::Char('r') {
+                            app.reset_progress()?;
+                        }
+                    }
                     AppMode::Normal => {
                         match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.mark_session_shortcuts_shown()?;
+                                return Ok(());
+                            }
                             KeyCode::Char('j') | KeyCode::Down => app.next(),
                             KeyCode::Char('k') | KeyCode::Up => app.previous(),
                             KeyCode::Char('h') | KeyCode::Left => app.previous_category(),
                             KeyCode::Char('l') | KeyCode::Right => app.next_category(),
-                            KeyCode::Char('d') => app.show_daily = !app.show_daily,
+                            KeyCode::Char('d') => app.show_session_shortcuts = !app.show_session_shortcuts,
                             KeyCode::Char('/') => {
                                 app.mode = AppMode::Search;
                             }
@@ -563,6 +748,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             }
                             KeyCode::Char('?') => {
                                 app.mode = AppMode::Help;
+                            }
+                            KeyCode::Char('s') => {
+                                app.mode = AppMode::Settings;
                             }
                             KeyCode::PageDown | KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 app.page_down(10);
@@ -619,11 +807,17 @@ fn ui(f: &mut Frame, app: &mut App) {
         "Category: All | ".to_string()
     };
 
-    let stats = Paragraph::new(format!(
-        "{}Showing {} of {} shortcuts",
-        filter_text,
-        app.filtered_shortcuts.len(),
+    let progress = format!(
+        "Progress: {}/{} seen | ",
+        app.state.shown_shortcuts.len(),
         app.shortcuts.len()
+    );
+
+    let stats = Paragraph::new(format!(
+        "{}{}Showing {} shortcuts",
+        filter_text,
+        progress,
+        app.filtered_shortcuts.len()
     ))
     .style(Style::default().fg(Color::Yellow));
     f.render_widget(stats, chunks[1]);
@@ -631,88 +825,54 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Content area
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if app.show_daily {
-            vec![Constraint::Length(6), Constraint::Min(0)]
+        .constraints(if app.show_session_shortcuts && !app.session_shortcuts.is_empty() {
+            vec![
+                Constraint::Length(3 + app.session_shortcuts.len() as u16 * 3),
+                Constraint::Min(0),
+            ]
         } else {
             vec![Constraint::Min(0)]
         })
         .split(chunks[2]);
 
-    // Daily shortcut box
-    if app.show_daily {
-        let daily = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Today's Shortcut: ", Style::default().fg(Color::Yellow)),
-                Span::styled(&app.daily_shortcut.key, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Description: ", Style::default().fg(Color::Cyan)),
-                Span::raw(&app.daily_shortcut.description),
-            ]),
-            Line::from(vec![
-                Span::styled("Category: ", Style::default().fg(Color::Magenta)),
-                Span::raw(&app.daily_shortcut.category),
-            ]),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("Daily Shortcut (toggle with 'd')"))
-        .style(Style::default().fg(Color::White));
-        f.render_widget(daily, content_chunks[0]);
+    // Session shortcuts box
+    if app.show_session_shortcuts && !app.session_shortcuts.is_empty() {
+        let mut lines = vec![Line::from(vec![Span::styled(
+            format!("New Shortcuts This Session ({} total)", app.session_shortcuts.len()),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )])];
+
+        for (i, shortcut) in app.session_shortcuts.iter().enumerate() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}. ", i + 1), Style::default().fg(Color::Gray)),
+                Span::styled(&shortcut.key, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" - "),
+                Span::raw(&shortcut.description),
+                Span::styled(format!(" [{}]", shortcut.category), Style::default().fg(Color::Magenta)),
+            ]));
+        }
+
+        let session = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Session Shortcuts (toggle with 'd')"))
+            .style(Style::default().fg(Color::White))
+            .wrap(Wrap { trim: true });
+        f.render_widget(session, content_chunks[0]);
     }
 
-    let list_area = if app.show_daily { content_chunks[1] } else { content_chunks[0] };
+    let list_area = if app.show_session_shortcuts && !app.session_shortcuts.is_empty() {
+        content_chunks[1]
+    } else {
+        content_chunks[0]
+    };
 
     // Show appropriate content based on mode
     match app.mode {
         AppMode::Help => {
-            let help_text = vec![
-                Line::from(""),
-                Line::from(vec![Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("j/k or ↓/↑", Style::default().fg(Color::Green)),
-                    Span::raw("    - Navigate shortcuts"),
-                ]),
-                Line::from(vec![
-                    Span::styled("h/l or ←/→", Style::default().fg(Color::Green)),
-                    Span::raw("    - Switch categories"),
-                ]),
-                Line::from(vec![
-                    Span::styled("g/G", Style::default().fg(Color::Green)),
-                    Span::raw("           - Jump to first/last"),
-                ]),
-                Line::from(vec![
-                    Span::styled("Ctrl+F/B", Style::default().fg(Color::Green)),
-                    Span::raw("      - Page down/up"),
-                ]),
-                Line::from(vec![
-                    Span::styled("/", Style::default().fg(Color::Green)),
-                    Span::raw("             - Search"),
-                ]),
-                Line::from(vec![
-                    Span::styled("c", Style::default().fg(Color::Green)),
-                    Span::raw("             - Clear category filter"),
-                ]),
-                Line::from(vec![
-                    Span::styled("d", Style::default().fg(Color::Green)),
-                    Span::raw("             - Toggle daily shortcut"),
-                ]),
-                Line::from(vec![
-                    Span::styled("?", Style::default().fg(Color::Green)),
-                    Span::raw("             - Toggle this help"),
-                ]),
-                Line::from(vec![
-                    Span::styled("q", Style::default().fg(Color::Green)),
-                    Span::raw("             - Quit"),
-                ]),
-                Line::from(""),
-            ];
-
-            let help = Paragraph::new(help_text)
-                .block(Block::default().borders(Borders::ALL).title("Help"))
-                .alignment(Alignment::Left)
-                .wrap(Wrap { trim: true });
-            f.render_widget(help, list_area);
+            render_help(f, list_area);
+        }
+        AppMode::Settings => {
+            render_settings(f, list_area, app);
         }
         AppMode::Search => {
             let search_chunks = Layout::default()
@@ -745,7 +905,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     let help_text = match app.mode {
         AppMode::Search => "ESC: Exit Search | Enter: Confirm",
         AppMode::Help => "?: Close Help",
-        AppMode::Normal => "j/k: Navigate | h/l: Categories | /: Search | ?: Help | q: Quit",
+        AppMode::Settings => "s/ESC: Close Settings | r: Reset Progress",
+        AppMode::Normal => "j/k: Navigate | h/l: Categories | /: Search | s: Settings | ?: Help | q: Quit",
     };
 
     let help = Paragraph::new(help_text)
@@ -755,13 +916,141 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(help, chunks[3]);
 }
 
+fn render_help(f: &mut Frame, area: Rect) {
+    let help_text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("j/k or ↓/↑", Style::default().fg(Color::Green)),
+            Span::raw("    - Navigate shortcuts"),
+        ]),
+        Line::from(vec![
+            Span::styled("h/l or ←/→", Style::default().fg(Color::Green)),
+            Span::raw("    - Switch categories"),
+        ]),
+        Line::from(vec![
+            Span::styled("g/G", Style::default().fg(Color::Green)),
+            Span::raw("           - Jump to first/last"),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl+F/B", Style::default().fg(Color::Green)),
+            Span::raw("      - Page down/up"),
+        ]),
+        Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Green)),
+            Span::raw("             - Search"),
+        ]),
+        Line::from(vec![
+            Span::styled("c", Style::default().fg(Color::Green)),
+            Span::raw("             - Clear category filter"),
+        ]),
+        Line::from(vec![
+            Span::styled("d", Style::default().fg(Color::Green)),
+            Span::raw("             - Toggle session shortcuts display"),
+        ]),
+        Line::from(vec![
+            Span::styled("s", Style::default().fg(Color::Green)),
+            Span::raw("             - Settings & info"),
+        ]),
+        Line::from(vec![
+            Span::styled("?", Style::default().fg(Color::Green)),
+            Span::raw("             - Toggle this help"),
+        ]),
+        Line::from(vec![
+            Span::styled("q", Style::default().fg(Color::Green)),
+            Span::raw("             - Quit (saves progress)"),
+        ]),
+        Line::from(""),
+    ];
+
+    let help = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    f.render_widget(help, area);
+}
+
+fn render_settings(f: &mut Frame, area: Rect, app: &App) {
+    let config_file = app.config_path.display().to_string();
+    let state_file = app.state_path.display().to_string();
+
+    let categories_text = if app.config.enabled_categories.is_empty() {
+        "All categories".to_string()
+    } else {
+        app.config.enabled_categories.join(", ")
+    };
+
+    let settings_text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("Settings & Configuration", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Config file: ", Style::default().fg(Color::Yellow)),
+            Span::raw(&config_file),
+        ]),
+        Line::from(vec![
+            Span::styled("State file: ", Style::default().fg(Color::Yellow)),
+            Span::raw(&state_file),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Current Settings:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Shortcuts per session: ", Style::default().fg(Color::Cyan)),
+            Span::raw(app.config.shortcuts_per_session.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enabled categories: ", Style::default().fg(Color::Cyan)),
+            Span::raw(categories_text),
+        ]),
+        Line::from(vec![
+            Span::styled("  Show session shortcuts: ", Style::default().fg(Color::Cyan)),
+            Span::raw(if app.config.show_session_shortcuts { "Yes" } else { "No" }),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Progress:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Shortcuts seen: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{}/{}", app.state.shown_shortcuts.len(), app.shortcuts.len())),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("To customize:", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  Edit the config file above to change:")]),
+        Line::from(vec![Span::raw("  - shortcuts_per_session: 1, 2, 3, etc.")]),
+        Line::from(vec![Span::raw("  - enabled_categories: [\"Vim\", \"Git\", \"VS Code\"]")]),
+        Line::from(vec![Span::raw("  - show_session_shortcuts: true or false")]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Press 'r'", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" to reset progress and start over"),
+        ]),
+    ];
+
+    let settings = Paragraph::new(settings_text)
+        .block(Block::default().borders(Borders::ALL).title("Settings"))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    f.render_widget(settings, area);
+}
+
 fn render_shortcut_list(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .filtered_shortcuts
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let key_id = format!("{}:{}", s.key, s.description);
+            let seen = app.state.shown_shortcuts.contains(&key_id);
+
+            let seen_marker = if seen { "✓ " } else { "  " };
+
             let content = vec![Line::from(vec![
+                Span::styled(
+                    seen_marker,
+                    Style::default().fg(if seen { Color::Green } else { Color::Gray }),
+                ),
                 Span::styled(
                     format!("{:20}", s.key),
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -787,8 +1076,8 @@ fn render_shortcut_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            "Shortcuts (showing {}/{})",
-            app.filtered_shortcuts.len(),
+            "All Shortcuts ({}/{} seen)",
+            app.state.shown_shortcuts.len(),
             app.shortcuts.len()
         )))
         .highlight_style(Style::default().bg(Color::DarkGray));
